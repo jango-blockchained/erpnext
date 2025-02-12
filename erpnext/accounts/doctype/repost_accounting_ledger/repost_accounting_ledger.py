@@ -1,6 +1,8 @@
 # Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and contributors
 # For license information, please see license.txt
 
+import inspect
+
 import frappe
 from frappe import _, qb
 from frappe.model.document import Document
@@ -8,11 +10,27 @@ from frappe.utils.data import comma_and
 
 
 class RepostAccountingLedger(Document):
-	def __init__(self, *args, **kwargs):
-		super(RepostAccountingLedger, self).__init__(*args, **kwargs)
-		self._allowed_types = set(
-			["Purchase Invoice", "Sales Invoice", "Payment Entry", "Journal Entry"]
+	# begin: auto-generated types
+	# This code is auto-generated. Do not modify anything in this block.
+
+	from typing import TYPE_CHECKING
+
+	if TYPE_CHECKING:
+		from frappe.types import DF
+
+		from erpnext.accounts.doctype.repost_accounting_ledger_items.repost_accounting_ledger_items import (
+			RepostAccountingLedgerItems,
 		)
+
+		amended_from: DF.Link | None
+		company: DF.Link | None
+		delete_cancelled_entries: DF.Check
+		vouchers: DF.Table[RepostAccountingLedgerItems]
+	# end: auto-generated types
+
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self._allowed_types = get_allowed_types_from_settings()
 
 	def validate(self):
 		self.validate_vouchers()
@@ -21,38 +39,17 @@ class RepostAccountingLedger(Document):
 
 	def validate_for_deferred_accounting(self):
 		sales_docs = [x.voucher_no for x in self.vouchers if x.voucher_type == "Sales Invoice"]
-		docs_with_deferred_revenue = frappe.db.get_all(
-			"Sales Invoice Item",
-			filters={"parent": ["in", sales_docs], "docstatus": 1, "enable_deferred_revenue": True},
-			fields=["parent"],
-			as_list=1,
-		)
-
 		purchase_docs = [x.voucher_no for x in self.vouchers if x.voucher_type == "Purchase Invoice"]
-		docs_with_deferred_expense = frappe.db.get_all(
-			"Purchase Invoice Item",
-			filters={"parent": ["in", purchase_docs], "docstatus": 1, "enable_deferred_expense": 1},
-			fields=["parent"],
-			as_list=1,
-		)
-
-		if docs_with_deferred_revenue or docs_with_deferred_expense:
-			frappe.throw(
-				_("Documents: {0} have deferred revenue/expense enabled for them. Cannot repost.").format(
-					frappe.bold(
-						comma_and([x[0] for x in docs_with_deferred_expense + docs_with_deferred_revenue])
-					)
-				)
-			)
+		validate_docs_for_deferred_accounting(sales_docs, purchase_docs)
 
 	def validate_for_closed_fiscal_year(self):
 		if self.vouchers:
 			latest_pcv = (
 				frappe.db.get_all(
 					"Period Closing Voucher",
-					filters={"company": self.company},
-					order_by="posting_date desc",
-					pluck="posting_date",
+					filters={"company": self.company, "docstatus": 1},
+					order_by="period_end_date desc",
+					pluck="period_end_date",
 					limit=1,
 				)
 				or None
@@ -74,15 +71,7 @@ class RepostAccountingLedger(Document):
 
 	def validate_vouchers(self):
 		if self.vouchers:
-			# Validate voucher types
-			voucher_types = set([x.voucher_type for x in self.vouchers])
-			if disallowed_types := voucher_types.difference(self._allowed_types):
-				frappe.throw(
-					_("{0} types are not allowed. Only {1} are.").format(
-						frappe.bold(comma_and(list(disallowed_types))),
-						frappe.bold(comma_and(list(self._allowed_types))),
-					)
-				)
+			validate_docs_for_voucher_types([x.voucher_type for x in self.vouchers])
 
 	def get_existing_ledger_entries(self):
 		vouchers = [x.voucher_no for x in self.vouchers]
@@ -101,6 +90,7 @@ class RepostAccountingLedger(Document):
 			).append(gle.update({"old": True}))
 
 	def generate_preview_data(self):
+		frappe.flags.through_repost_accounting_ledger = True
 		self.gl_entries = []
 		self.get_existing_ledger_entries()
 		for x in self.vouchers:
@@ -139,18 +129,24 @@ class RepostAccountingLedger(Document):
 		return rendered_page
 
 	def on_submit(self):
-		job_name = "repost_accounting_ledger_" + self.name
-		frappe.enqueue(
-			method="erpnext.accounts.doctype.repost_accounting_ledger.repost_accounting_ledger.start_repost",
-			account_repost_doc=self.name,
-			is_async=True,
-			job_name=job_name,
-		)
-		frappe.msgprint(_("Repost has started in the background"))
+		if len(self.vouchers) > 5:
+			job_name = "repost_accounting_ledger_" + self.name
+			frappe.enqueue(
+				method="erpnext.accounts.doctype.repost_accounting_ledger.repost_accounting_ledger.start_repost",
+				account_repost_doc=self.name,
+				is_async=True,
+				job_name=job_name,
+			)
+			frappe.msgprint(_("Repost has started in the background"))
+		else:
+			start_repost(self.name)
 
 
 @frappe.whitelist()
 def start_repost(account_repost_doc=str) -> None:
+	from erpnext.accounts.general_ledger import make_reverse_gl_entries
+
+	frappe.flags.through_repost_accounting_ledger = True
 	if account_repost_doc:
 		repost_doc = frappe.get_doc("Repost Accounting Ledger", account_repost_doc)
 
@@ -162,7 +158,9 @@ def start_repost(account_repost_doc=str) -> None:
 				doc = frappe.get_doc(x.voucher_type, x.voucher_no)
 
 				if repost_doc.delete_cancelled_entries:
-					frappe.db.delete("GL Entry", filters={"voucher_type": doc.doctype, "voucher_no": doc.name})
+					frappe.db.delete(
+						"GL Entry", filters={"voucher_type": doc.doctype, "voucher_no": doc.name}
+					)
 					frappe.db.delete(
 						"Payment Ledger Entry", filters={"voucher_type": doc.doctype, "voucher_no": doc.name}
 					)
@@ -173,11 +171,89 @@ def start_repost(account_repost_doc=str) -> None:
 						doc.make_gl_entries_on_cancel()
 
 					doc.docstatus = 1
+					if doc.doctype == "Sales Invoice":
+						doc.force_set_against_income_account()
+					else:
+						doc.force_set_against_expense_account()
 					doc.make_gl_entries()
 
-				elif doc.doctype in ["Payment Entry", "Journal Entry"]:
+				elif doc.doctype in ["Payment Entry", "Journal Entry", "Expense Claim"]:
 					if not repost_doc.delete_cancelled_entries:
 						doc.make_gl_entries(1)
 					doc.make_gl_entries()
+				elif doc.doctype in frappe.get_hooks("repost_allowed_doctypes"):
+					if hasattr(doc, "make_gl_entries") and callable(doc.make_gl_entries):
+						if not repost_doc.delete_cancelled_entries:
+							if "cancel" in inspect.getfullargspec(doc.make_gl_entries):
+								doc.make_gl_entries(cancel=1)
+							else:
+								make_reverse_gl_entries(voucher_type=doc.doctype, voucher_no=doc.name)
+						doc.make_gl_entries()
 
-				frappe.db.commit()
+
+def get_allowed_types_from_settings():
+	return [
+		x.document_type
+		for x in frappe.db.get_all(
+			"Repost Allowed Types", filters={"allowed": True}, fields=["distinct(document_type)"]
+		)
+	]
+
+
+def validate_docs_for_deferred_accounting(sales_docs, purchase_docs):
+	docs_with_deferred_revenue = frappe.db.get_all(
+		"Sales Invoice Item",
+		filters={"parent": ["in", sales_docs], "docstatus": 1, "enable_deferred_revenue": True},
+		fields=["parent"],
+		as_list=1,
+	)
+
+	docs_with_deferred_expense = frappe.db.get_all(
+		"Purchase Invoice Item",
+		filters={"parent": ["in", purchase_docs], "docstatus": 1, "enable_deferred_expense": 1},
+		fields=["parent"],
+		as_list=1,
+	)
+
+	if docs_with_deferred_revenue or docs_with_deferred_expense:
+		frappe.throw(
+			_("Documents: {0} have deferred revenue/expense enabled for them. Cannot repost.").format(
+				frappe.bold(
+					comma_and([x[0] for x in docs_with_deferred_expense + docs_with_deferred_revenue])
+				)
+			)
+		)
+
+
+def validate_docs_for_voucher_types(doc_voucher_types):
+	allowed_types = get_allowed_types_from_settings()
+	# Validate voucher types
+	voucher_types = set(doc_voucher_types)
+	if disallowed_types := voucher_types.difference(allowed_types):
+		message = "are" if len(disallowed_types) > 1 else "is"
+		frappe.throw(
+			_("{0} {1} not allowed to be reposted. Modify {2} to enable reposting.").format(
+				frappe.bold(comma_and(list(disallowed_types))),
+				message,
+				frappe.bold(
+					frappe.utils.get_link_to_form(
+						"Repost Accounting Ledger Settings", "Repost Accounting Ledger Settings"
+					)
+				),
+			)
+		)
+
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def get_repost_allowed_types(doctype, txt, searchfield, start, page_len, filters):
+	filters = {"allowed": True}
+
+	if txt:
+		filters.update({"document_type": ("like", f"%{txt}%")})
+
+	if allowed_types := frappe.db.get_all(
+		"Repost Allowed Types", filters=filters, fields=["distinct(document_type)"], as_list=1
+	):
+		return allowed_types
+	return []
